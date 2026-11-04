@@ -93,7 +93,7 @@ export const demoProducts: Product[] = [
 ]
 
 export const demoCatalogueProducts: PublicCatalogueProduct[] = demoProducts
-  .filter((product) => product.is_active)
+  .filter((product): product is Product & { vendor_id: string } => product.is_active && product.vendor_id !== null)
   .map((product) => ({
     id: product.id,
     name_en: product.name_en,
@@ -108,6 +108,7 @@ export const demoCatalogueProducts: PublicCatalogueProduct[] = demoProducts
     sort_order: product.sort_order,
     created_at: product.created_at,
     updated_at: product.updated_at,
+    vendor_id: product.vendor_id,
     stock_status: getStockStatus(product.stock_quantity, product.low_stock_threshold),
   }))
 

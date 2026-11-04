@@ -29,7 +29,12 @@ import {
 import { categoryLabel, translate, type TranslationKey } from './lib/i18n'
 import { CUSTOMER_INTEREST_STORAGE_KEY, clearInterestQuantities, parseInterestQuantities, serializeInterestQuantities, updateInterestQuantity } from './lib/customer-interest'
 import { makeWhatsAppMessage, makeWhatsAppUrl, validateInterest } from './lib/interest'
-import { requireSupabase, supabase } from './lib/supabase'
+import { normalizeIndianMobile } from './lib/indian-mobile'
+import { captchaProvider, captchaSitekey, protectedSubmissionEnabled, submitProtectedInterest } from './lib/submit-interest'
+import { CaptchaChallenge } from './CaptchaChallenge'
+import { requireSupabase, supabase, supabaseConfigIssue } from './lib/supabase'
+import { describeSupabaseConfigIssue } from './lib/supabase-config'
+import { applyImageFallback, classifyCatalogueError, describeCatalogueIssue, productImageSrc, staffErrorMessage, type CatalogueIssue } from './lib/catalogue'
 import { getStockStatus, isValidStockValue, type StockStatus } from './lib/stock'
 import { demoCatalogueProducts, demoEnquiries, demoProducts, demoProfile, demoShop, demoVendorApplications, demoVendorApplicationEvents, demoVendorProfile } from './lib/demo'
 import type {
@@ -54,6 +59,9 @@ const DEV_STAFF_PREVIEW = import.meta.env.DEV && (
 )
 
 function App() {
+  if (!import.meta.env.DEV && supabaseConfigIssue) {
+    return <ConfigurationErrorPage message={describeSupabaseConfigIssue(supabaseConfigIssue)} />
+  }
   return (
     <BrowserRouter>
       <Routes>
@@ -91,7 +99,7 @@ function CustomerPage() {
   const [products, setProducts] = useState<PublicCatalogueProduct[]>([])
   const [shop, setShop] = useState<ShopSettings | null>(null)
   const [loading, setLoading] = useState(true)
-  const [loadError, setLoadError] = useState('')
+  const [loadError, setLoadError] = useState<CatalogueIssue | ''>('')
   const [query, setQuery] = useState('')
   const [category, setCategory] = useState('All')
   const [quantities, setQuantities] = useState<Record<string, number>>(initialInterest.quantities)
@@ -102,6 +110,8 @@ function CustomerPage() {
   const [saving, setSaving] = useState(false)
   const [savedReference, setSavedReference] = useState('')
   const [whatsAppUrl, setWhatsAppUrl] = useState('')
+  const [captchaToken, setCaptchaToken] = useState('')
+  const [captchaAttempt, setCaptchaAttempt] = useState(0)
 
   const t = (key: TranslationKey) => translate(language, key)
 
@@ -128,8 +138,9 @@ function CustomerPage() {
         setProducts(productRows ?? [])
       } catch (error) {
         if (!active) return
-        const message = error instanceof Error ? error.message : 'Unable to load the catalogue.'
-        setLoadError(message)
+        const issue = classifyCatalogueError(error)
+        console.error(`[catalogue] ${issue}: ${describeCatalogueIssue(issue)}`)
+        setLoadError(issue)
       } finally {
         if (active) setLoading(false)
       }
@@ -180,12 +191,21 @@ function CustomerPage() {
   }
 
   function changeQuantity(productId: string, delta: number) {
+    if (saving || savedReference) return
+    const product = products.find((item) => item.id === productId)
+    const selectedVendorId = interestLines[0]?.product.vendor_id
+    if (delta > 0 && product && selectedVendorId && product.vendor_id !== selectedVendorId) {
+      setFormError(t('singleVendorError'))
+      return
+    }
     const next = updateInterestQuantity(quantities, productId, delta)
     setQuantities(next)
     persistInterest(next)
+    setFormError('')
   }
 
   function clearInterestList() {
+    if (saving || savedReference) return
     const next = clearInterestQuantities()
     setQuantities(next)
     persistInterest(next)
@@ -193,10 +213,11 @@ function CustomerPage() {
 
   async function submitInterest(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
+    if (saving || savedReference) return
     setFormError('')
     const validation = validateInterest(name, phone, interestLines)
     if (validation) {
-      const keys = { name: 'nameError', phone: 'phoneError', items: 'itemsError', quantity: 'quantityError' } as const
+      const keys = { name: 'nameError', phone: 'phoneError', items: 'itemsError', quantity: 'quantityError', vendor: 'singleVendorError' } as const
       setFormError(t(keys[validation]))
       return
     }
@@ -208,22 +229,30 @@ function CustomerPage() {
       setFormError('Development preview only: this interest enquiry was not submitted or saved. Configure Supabase to enable submissions.')
       return
     }
+    if (!protectedSubmissionEnabled) {
+      setFormError(t('submissionUnavailable'))
+      return
+    }
+    if (!captchaToken) {
+      setFormError(t('captchaRequired'))
+      return
+    }
     setSaving(true)
     try {
-      const client = requireSupabase()
-      const { data, error } = await client.rpc('submit_interest', {
-        p_customer_name: name.trim(),
-        p_customer_phone: phone.trim(),
-        p_items: interestLines.map(({ product, quantity }) => ({ product_id: product.id, quantity })),
+      const data = await submitProtectedInterest({
+        customer_name: name.trim(),
+        customer_phone: phone.trim(),
+        items: interestLines.map(({ product, quantity }) => ({ product_id: product.id, quantity })),
+        captcha_token: captchaToken,
       })
-      if (error) throw error
-      if (!data?.reference_code) throw new Error(t('submitError'))
-      const url = makeWhatsAppUrl(shop.whatsapp_number, name.trim(), phone.trim(), interestLines, language, data.reference_code)
+      const url = makeWhatsAppUrl(data.whatsapp_number, name.trim(), phone.trim(), interestLines, language, data.reference_code)
       setSavedReference(data.reference_code)
       setWhatsAppUrl(url)
     } catch (error) {
       setFormError(localizeSubmissionError(error, language))
     } finally {
+      setCaptchaToken('')
+      setCaptchaAttempt((attempt) => attempt + 1)
       setSaving(false)
     }
   }
@@ -232,7 +261,7 @@ function CustomerPage() {
 
   return (
     <div className="customer-page" lang={language === 'kn' ? 'kn' : 'en'}>
-      {DEV_CUSTOMER_PREVIEW ? <div className="customer-preview-banner"><span>DEVELOPMENT PREVIEW · SAMPLE CATALOGUE · NO DATABASE ACCESS</span><DevPortalLinks /></div> : null}
+      {DEV_CUSTOMER_PREVIEW ? <div className="customer-preview-banner"><span>DEVELOPMENT PREVIEW · SAMPLE CATALOGUE · NO DATABASE ACCESS</span><DevConfigNotice /><DevPortalLinks /></div> : null}
       <header className="customer-header">
         <a className="brand-lockup" href="#" aria-label={shopName}>
           <span className="brand-mark">{shop?.logo_url ? <img src={shop.logo_url} alt="" /> : <Flame size={20} />}</span>
@@ -294,7 +323,7 @@ function CustomerPage() {
 
           {loading ? <div className="catalogue-message"><span className="spinner" />{t('loading')}</div> : null}
           {!loading && loadError ? (
-            <div className="catalogue-message error-message"><CircleAlert size={20} /><span>{loadError.includes('not configured') ? t('configError') : t('loadError')}</span></div>
+            <div className="catalogue-message error-message" role="alert"><CircleAlert size={20} /><span>{import.meta.env.DEV ? `Live catalogue unavailable (development diagnostic): ${describeCatalogueIssue(loadError)}` : loadError === 'not-configured' ? t('configError') : t('loadError')}</span></div>
           ) : null}
           {!loading && !loadError && !shop ? <div className="catalogue-message">{t('unavailable')}</div> : null}
           {!loading && !loadError && shop && !shop.is_active ? <div className="catalogue-message">{t('unavailable')}</div> : null}
@@ -309,8 +338,9 @@ function CustomerPage() {
                   product={product}
                   language={language}
                   stockStatus={product.stock_status}
+                  sample={DEV_CUSTOMER_PREVIEW}
                   quantity={quantities[product.id] ?? 0}
-                  disabled={Boolean(savedReference)}
+                  disabled={saving || Boolean(savedReference)}
                   onAdd={() => changeQuantity(product.id, 1)}
                 />
               ))}
@@ -332,18 +362,18 @@ function CustomerPage() {
                 <div className="interest-summary">
                   <strong>{t('selectedSummary')}</strong>
                   <span>{interestLines.length} {t('uniqueProducts')} · {count} {t('totalQuantities')}</span>
-                  <button type="button" className="text-button" disabled={Boolean(savedReference)} onClick={clearInterestList}>{t('clearInterest')}</button>
+                  <button type="button" className="text-button" disabled={saving || Boolean(savedReference)} onClick={clearInterestList}>{t('clearInterest')}</button>
                 </div>
                 <div className="interest-lines">
                   {interestLines.map(({ product, quantity }) => (
                     <div className="interest-line" key={product.id}>
-                      <img src={product.image_url || fallbackProductImage} alt="" />
+                      <img src={productImageSrc(product.image_url)} onError={applyImageFallback} alt="" />
                       <div className="interest-line-name">
                         <strong>{language === 'kn' ? product.name_kn || product.name_en : product.name_en}</strong>
                         <span>{priceLabel(product, language)}</span>
                       </div>
-                      <QuantityControl quantity={quantity} disabled={Boolean(savedReference)} decreaseLabel={t('decreaseQuantity')} increaseLabel={t('increaseQuantity')} onMinus={() => changeQuantity(product.id, -1)} onPlus={() => changeQuantity(product.id, 1)} />
-                      <button className="icon-button remove-button" disabled={Boolean(savedReference)} aria-label={`${t('removeProduct')} ${product.name_en}`} onClick={() => changeQuantity(product.id, -quantity)}><Trash2 size={16} /></button>
+                      <QuantityControl quantity={quantity} disabled={saving || Boolean(savedReference)} decreaseLabel={t('decreaseQuantity')} increaseLabel={t('increaseQuantity')} onMinus={() => changeQuantity(product.id, -1)} onPlus={() => changeQuantity(product.id, 1)} />
+                      <button className="icon-button remove-button" disabled={saving || Boolean(savedReference)} aria-label={`${t('removeProduct')} ${product.name_en}`} onClick={() => changeQuantity(product.id, -quantity)}><Trash2 size={16} /></button>
                     </div>
                   ))}
                 </div>
@@ -355,8 +385,8 @@ function CustomerPage() {
               <form className="interest-form" onSubmit={(event) => void submitInterest(event)} noValidate>
                 {interestStorageError ? <p className="privacy-note storage-warning" role="status">{language === 'kn' ? 'ಈ ಸಾಧನದಲ್ಲಿ ಆಸಕ್ತಿ ಪಟ್ಟಿಯನ್ನು ಉಳಿಸಲಾಗಲಿಲ್ಲ.' : 'Your interest list could not be saved in this browser.'}</p> : null}
                 <div className="form-grid">
-                  <label>{t('name')}<input autoComplete="name" value={name} onChange={(event) => setName(event.target.value)} placeholder={t('namePlaceholder')} maxLength={100} disabled={Boolean(savedReference)} /></label>
-                  <label>{t('phone')}<input autoComplete="tel" inputMode="tel" value={phone} onChange={(event) => setPhone(event.target.value)} placeholder={t('phonePlaceholder')} maxLength={16} disabled={Boolean(savedReference)} /></label>
+                  <label>{t('name')}<input autoComplete="name" value={name} onChange={(event) => setName(event.target.value)} placeholder={t('namePlaceholder')} maxLength={100} disabled={saving || Boolean(savedReference)} /></label>
+                  <label>{t('phone')}<input autoComplete="tel" inputMode="tel" value={phone} onChange={(event) => setPhone(event.target.value)} placeholder={t('phonePlaceholder')} maxLength={16} disabled={saving || Boolean(savedReference)} /></label>
                 </div>
                 <p className="privacy-note"><ShieldCheck size={15} />{t('privacyNote')}</p>
                 <div className="customer-disclaimer">{t('enquiryNotice')}</div>
@@ -365,6 +395,11 @@ function CustomerPage() {
                   <pre>{makeWhatsAppMessage(name.trim() || '…', phone.trim() || '…', interestLines, language, savedReference || undefined)}</pre>
                 </details>
                 {formError ? <p className="form-error" role="alert"><CircleAlert size={16} />{formError}</p> : null}
+                {!savedReference && !DEV_CUSTOMER_PREVIEW ? (
+                  protectedSubmissionEnabled && (captchaProvider === 'turnstile' || captchaProvider === 'hcaptcha')
+                    ? <CaptchaChallenge key={captchaAttempt} provider={captchaProvider} sitekey={captchaSitekey} language={language} onToken={setCaptchaToken} />
+                    : <p className="form-error" role="status">{t('submissionUnavailable')}</p>
+                ) : null}
                 {savedReference ? (
                   <div className="saved-panel" role="status">
                     <span className="saved-check"><Check size={19} /></span>
@@ -373,7 +408,7 @@ function CustomerPage() {
                     <p className="whatsapp-fallback">{t('whatsappFallback')}</p>
                   </div>
                 ) : (
-                  <button className="button button-submit" type="submit" disabled={saving}>
+                  <button className="button button-submit" type="submit" disabled={saving || (!DEV_CUSTOMER_PREVIEW && (!protectedSubmissionEnabled || !captchaToken))}>
                     {saving ? <><span className="spinner spinner-dark" />{t('submitting')}</> : <><MessageCircle size={18} />{t('submitInterest')}<ArrowRight size={17} /></>}
                   </button>
                 )}
@@ -392,23 +427,23 @@ function CustomerPage() {
   )
 }
 
-const fallbackProductImage = 'https://images.unsplash.com/photo-1498931299472-f7a63a5a1cfa?auto=format&fit=crop&w=800&q=80'
-
-function ProductCard({ product, language, quantity, disabled, onAdd, stockStatus }: {
+function ProductCard({ product, language, quantity, disabled, onAdd, stockStatus, sample = false }: {
   product: PublicCatalogueProduct
   language: Language
   stockStatus: StockStatus
   quantity: number
   disabled: boolean
   onAdd: () => void
+  sample?: boolean
 }) {
   const name = language === 'kn' ? product.name_kn || product.name_en : product.name_en
   const description = language === 'kn' ? product.description_kn || product.description_en : product.description_en
   return (
-    <article className="product-card">
+    <article className="product-card" data-catalogue-source={sample ? 'sample' : 'live'}>
       <div className="product-image-wrap">
-        <img src={product.image_url || fallbackProductImage} alt={name} loading="lazy" />
+        <img src={productImageSrc(product.image_url)} onError={applyImageFallback} alt={name} loading="lazy" />
         <span className="product-category">{categoryLabel(language, product.category)}</span>
+        {sample ? <span className="product-sample-tag">Sample</span> : null}
         <span className={`stock-badge product-stock stock-${stockStatus}`}>{translate(language, stockStatus === 'in-stock' ? 'inStock' : stockStatus === 'low-stock' ? 'lowStock' : 'outOfStock')}</span>
         {quantity > 0 ? <span className="product-added"><Check size={13} /> {quantity}</span> : null}
       </div>
@@ -455,6 +490,25 @@ function LanguageSwitch({ language, label, onChange }: { language: Language; lab
   )
 }
 
+function DevConfigNotice() {
+  if (!supabaseConfigIssue) return null
+  return <span className="dev-config-notice" role="status">Supabase not connected: {describeSupabaseConfigIssue(supabaseConfigIssue)}</span>
+}
+
+function ConfigurationErrorPage({ message }: { message: string }) {
+  return (
+    <div className="staff-screen">
+      <section className="signin-card" role="alert">
+        <span className="staff-logo"><ShieldCheck size={20} /></span>
+        <span className="eyebrow">ANIL CRACKERS · CONFIGURATION</span>
+        <h1>Site configuration required</h1>
+        <p>The catalogue cannot connect to its database. {message}</p>
+        <p>Update the deployment environment variables and rebuild. No secret values are shown here.</p>
+      </section>
+    </div>
+  )
+}
+
 function DevPortalLinks({ activeRole }: { activeRole?: UserRole }) {
   return (
     <div className="dev-portal-links" aria-label="Development portal links">
@@ -490,6 +544,13 @@ function priceLabel(product: Pick<Product, 'selling_price'>, language: Language)
 
 function localizeSubmissionError(error: unknown, language: Language) {
   const message = error instanceof Error ? error.message : ''
+  if (message === 'rate_limited') return translate(language, 'rateLimited')
+  if (message === 'captcha_failed' || message === 'captcha_required') return translate(language, 'captchaRequired')
+  if (message === 'captcha_unavailable') return translate(language, 'captchaUnavailable')
+  if (message === 'submission_unavailable' || message === 'client_address_unavailable' || message === 'database_unavailable') return translate(language, 'submissionUnavailable')
+  if (message === 'invalid_phone') return translate(language, 'phoneError')
+  if (message.includes('vendor WhatsApp')) return translate(language, 'vendorWhatsappMissing')
+  if (message.includes('one approved vendor')) return translate(language, 'singleVendorError')
   if (message.includes('not configured')) return translate(language, 'whatsappMissing')
   if (message.includes('no longer available') || message.includes('product is invalid')) return translate(language, 'productUnavailable')
   if (message.includes('30 products')) return translate(language, 'maxItemsError')
@@ -552,7 +613,7 @@ function StaffGate({ role, children }: { role: UserRole; children: React.ReactNo
         }
       } catch (cause) {
         if (active) {
-          setError(cause instanceof Error ? cause.message : 'Unable to verify this account.')
+          setError(staffErrorMessage(cause, 'Unable to verify this account.'))
           setLoading(false)
         }
       }
@@ -652,11 +713,17 @@ function VendorApplicationPage({ application, authEmail, authName, onSubmitted }
     setError('')
     setSaving(true)
     const form = new FormData(event.currentTarget)
+    const phone = normalizeIndianMobile(String(form.get('phone') ?? ''))
+    if (!phone) {
+      setError('Enter a valid 10-digit Indian mobile number, optionally prefixed with +91.')
+      setSaving(false)
+      return
+    }
     try {
       const { data, error: submitError } = await requireSupabase().rpc('submit_vendor_application', {
         p_business_name: String(form.get('business_name') ?? '').trim(),
         p_owner_name: String(form.get('owner_name') ?? '').trim(),
-        p_phone: String(form.get('phone') ?? '').trim(),
+        p_phone: phone,
         p_location: String(form.get('location') ?? '').trim(),
       })
       if (submitError) throw submitError
@@ -695,7 +762,7 @@ function VendorApplicationPage({ application, authEmail, authName, onSubmitted }
             <form className="vendor-application-form" onSubmit={(event) => void submit(event)}>
               <FormField name="business_name" label="Business name" defaultValue={application?.business_name} required />
               <FormField name="owner_name" label="Owner name" defaultValue={application?.owner_name || authName} required />
-              <FormField name="phone" label="Business phone" defaultValue={application?.phone} required />
+              <FormField name="phone" label="Business phone (Indian mobile; used for WhatsApp enquiries)" defaultValue={application?.phone} required />
               <FormField name="location" label="Business location" defaultValue={application?.location} required />
               <label className="field-label">Google account email<input value={application?.email || authEmail} readOnly /></label>
               {error ? <p className="form-error" role="alert">{error}</p> : null}
@@ -775,7 +842,7 @@ function StaffDashboard({ role, preview = false }: { role: UserRole; preview?: b
         setApplicationEvents(eventsResult.data ?? [])
       }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'Unable to load dashboard data.')
+      setError(staffErrorMessage(cause, 'Unable to load dashboard data.'))
     } finally {
       setLoading(false)
     }
@@ -937,16 +1004,10 @@ function StaffDashboard({ role, preview = false }: { role: UserRole; preview?: b
     event.preventDefault()
     if (!settings) return
     const form = new FormData(event.currentTarget)
-    const whatsappNumber = String(form.get('whatsapp_number') ?? '').trim()
-    if (!/^[1-9]\d{9,14}$/.test(whatsappNumber.replace(/\D/g, ''))) {
-      setError('Enter the shop WhatsApp number with its country code (10–15 digits).')
-      return
-    }
     if (preview) {
       setSettings((current) => current ? {
         ...current,
         shop_name: String(form.get('shop_name') ?? '').trim(),
-        whatsapp_number: whatsappNumber,
         address: String(form.get('address') ?? '').trim(),
         description: String(form.get('description') ?? '').trim(),
         is_active: form.get('is_active') === 'on',
@@ -958,7 +1019,6 @@ function StaffDashboard({ role, preview = false }: { role: UserRole; preview?: b
     try {
       const { error: updateError } = await requireSupabase().from('shop_settings').update({
         shop_name: String(form.get('shop_name') ?? '').trim(),
-        whatsapp_number: whatsappNumber,
         address: String(form.get('address') ?? '').trim(),
         description: String(form.get('description') ?? '').trim(),
         is_active: form.get('is_active') === 'on',
@@ -1013,7 +1073,7 @@ function StaffDashboard({ role, preview = false }: { role: UserRole; preview?: b
         <nav className="staff-nav">
           {tabs.map(({ key, label, icon: Icon }) => <button key={key} className={tab === key ? 'staff-nav-item active' : 'staff-nav-item'} onClick={() => { setTab(key); setMenuOpen(false) }}><Icon size={18} />{label}{key === 'enquiries' && enquiries.filter((item) => item.status === 'new').length > 0 ? <span className="nav-count">{enquiries.filter((item) => item.status === 'new').length}</span> : null}</button>)}
         </nav>
-        {import.meta.env.DEV ? <div className="staff-dev-portals"><span>PORTAL PREVIEW</span><DevPortalLinks activeRole={role} /></div> : null}
+        {import.meta.env.DEV ? <div className="staff-dev-portals"><span>PORTAL PREVIEW</span><DevConfigNotice /><DevPortalLinks activeRole={role} /></div> : null}
         <div className="sidebar-bottom">
           <div className="staff-profile"><span className="avatar">{(profile?.display_name || (isAdmin ? 'A' : 'V')).slice(0, 1).toUpperCase()}</span><span><strong>{profile?.display_name || (isAdmin ? 'Super Admin' : 'Vendor')}</strong><small>{isAdmin ? 'Platform owner' : 'Shop manager'}</small></span></div>
           <button className="signout-button" onClick={() => void signOut()}><LogOut size={17} />{translate('en', 'signOut')}</button>
@@ -1047,7 +1107,7 @@ function StaffDashboard({ role, preview = false }: { role: UserRole; preview?: b
           } else {
             setProducts((current) => current.map((item) => item.id === editingProduct.id ? { ...item, ...values, updated_at: timestamp } : item))
           }
-          setNotice('Preview only: product changes are held in memory and were not saved to Supabase.')
+          setNotice('Preview only: product changes are held in memory, were not saved to Supabase and will not appear in the customer catalogue.')
         } else {
           await reload()
           setNotice(translate('en', 'savedChanges'))
@@ -1090,7 +1150,7 @@ function Overview({ role, preview, products, enquiries, settings, vendor, onTogg
         </section>
         <section className="dashboard-card">
           <div className="card-heading"><div><h3>{translate('en', 'recentProducts')}</h3><p>Your latest catalogue updates</p></div><button className="text-button" onClick={() => onNavigate('products')}>Manage <ArrowRight size={14} /></button></div>
-          {recentProducts.length ? <div className="product-mini-list">{recentProducts.map((product) => <div className="product-mini" key={product.id}><img src={product.image_url || fallbackProductImage} alt="" /><span><strong>{product.name_en}</strong><small>{product.category}</small></span><span className={product.is_active ? 'mini-state active' : 'mini-state'}>{product.is_active ? 'Active' : 'Inactive'}</span></div>)}</div> : <EmptyState text="No products added yet." />}
+          {recentProducts.length ? <div className="product-mini-list">{recentProducts.map((product) => <div className="product-mini" key={product.id}><img src={productImageSrc(product.image_url)} onError={applyImageFallback} alt="" /><span><strong>{product.name_en}</strong><small>{product.category}</small></span><span className={product.is_active ? 'mini-state active' : 'mini-state'}>{product.is_active ? 'Active' : 'Inactive'}</span></div>)}</div> : <EmptyState text="No products added yet." />}
         </section>
       </div>
       {role === 'superadmin' ? <div className="admin-overview-row">
@@ -1247,7 +1307,7 @@ function ProductsPanel({ products, canManageProducts, onAdd, onEdit, onToggle, o
         <label className="select-field"><span>Stock</span><select value={stockFilter} onChange={(event) => setStockFilter(event.target.value as typeof stockFilter)}><option value="all">All stock</option><option value="in-stock">In stock</option><option value="low-stock">Low stock</option><option value="out-of-stock">Out of stock</option></select><ChevronDown size={15} /></label>
       </div>
       {visible.length ? <div className="manage-product-grid">{visible.map((product) => <article className="manage-product-card" key={product.id}>
-        <div className="manage-product-image"><img src={product.image_url || fallbackProductImage} alt="" loading="lazy" /><span className={product.is_active ? 'mini-state active' : 'mini-state'}>{product.is_active ? 'Active' : 'Inactive'}</span></div>
+        <div className="manage-product-image"><img src={productImageSrc(product.image_url)} onError={applyImageFallback} alt="" loading="lazy" /><span className={product.is_active ? 'mini-state active' : 'mini-state'}>{product.is_active ? 'Active' : 'Inactive'}</span></div>
         <div className="manage-product-info"><span className="product-category admin-category">{product.category}</span><h3>{product.name_en}</h3><p className="kn-subtitle">{product.name_kn}</p><div className="manage-prices">{product.selling_price !== null ? <strong>{formatPrice(product.selling_price)}</strong> : <span>No display price</span>}{product.mrp !== null ? <del>{formatPrice(product.mrp)}</del> : null}</div><div className="stock-management-row"><span className={`stock-badge stock-${getStockStatus(product.stock_quantity, product.low_stock_threshold)}`}>{stockStatusLabel(getStockStatus(product.stock_quantity, product.low_stock_threshold))}</span><strong>{product.stock_quantity} available</strong><small>Alert at {product.low_stock_threshold}</small></div><div className="manage-product-actions">{canManageProducts ? <button className="button button-outline" onClick={() => onEdit(product)}>Edit</button> : null}<button className="button button-outline" title={product.is_active ? 'Deactivate' : 'Activate'} onClick={() => onToggle(product)}>{product.is_active ? 'Deactivate' : 'Activate'}</button>{canManageProducts ? <button className="icon-button danger-icon" title="Delete product" onClick={() => onDelete(product)}><Trash2 size={16} /></button> : null}</div></div>
       </article>)}</div> : <div className="dashboard-card"><EmptyState text="No products in this view." /></div>}
     </section>
@@ -1311,7 +1371,6 @@ function SettingsPanel({ settings, vendor, preview, onSubmit, onToggleVendor, on
             </div>
           </div>
           <FormField name="shop_name" label={translate('en', 'shopName')} defaultValue={settings.shop_name} required />
-          <FormField name="whatsapp_number" label={translate('en', 'whatsappNumber')} defaultValue={settings.whatsapp_number} required />
           <FormField name="address" label={translate('en', 'address')} defaultValue={settings.address} />
           <label className="field-label">{translate('en', 'description')}<textarea name="description" rows={4} defaultValue={settings.description} /></label>
           <label className="checkbox-field"><input type="checkbox" name="is_active" defaultChecked={settings.is_active} /><span><strong>{translate('en', 'shopActive')}</strong><small>When paused, the customer catalogue will not be available.</small></span></label>
@@ -1451,7 +1510,7 @@ function ProductEditor({ product, ownerId, preview, onClose, onSaved }: {
         <div className="modal-header"><div><span className="eyebrow">CATALOGUE</span><h2 id="product-editor-title">{product ? 'Edit product' : 'Add product'}</h2></div><button className="icon-button" onClick={onClose} aria-label="Close dialog"><X size={19} /></button></div>
         <form className="product-editor-form" onSubmit={(event) => void submit(event)}>
           <div className="editor-image-row">
-            <img className="editor-image-preview" src={imageUrl || fallbackProductImage} alt="" />
+            <img className="editor-image-preview" src={productImageSrc(imageUrl)} onError={applyImageFallback} alt="" />
             <label className="button button-outline upload-trigger"><ImagePlus size={16} />{translate('en', 'uploadImage')}<input type="file" accept="image/jpeg,image/png,image/webp,image/avif" onChange={(event) => {
               selectImage(event.target.files?.[0])
               event.currentTarget.value = ''

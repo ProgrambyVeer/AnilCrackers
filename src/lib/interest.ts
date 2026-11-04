@@ -1,19 +1,18 @@
 import type { Language, Product } from '../types'
+import { normalizeIndianMobile } from './indian-mobile'
 
 export type InterestLine = {
-  product: Pick<Product, 'id' | 'name_en' | 'name_kn' | 'selling_price' | 'image_url' | 'category'>
+  product: Pick<Product, 'id' | 'vendor_id' | 'name_en' | 'name_kn' | 'selling_price' | 'image_url' | 'category'>
   quantity: number
 }
 
 export function validateInterest(name: string, phone: string, lines: InterestLine[]) {
   const cleanName = name.trim()
-  const digits = phone.replace(/\D/g, '')
-  const phoneDigits = digits.startsWith('91') && digits.length === 12 ? digits.slice(2) : digits
 
   if (cleanName.length < 2 || cleanName.length > 100) {
     return 'name'
   }
-  if (!/^[6-9]\d{9}$/.test(phoneDigits)) {
+  if (!normalizeIndianMobile(phone)) {
     return 'phone'
   }
   if (lines.length < 1 || lines.length > 30) {
@@ -21,6 +20,10 @@ export function validateInterest(name: string, phone: string, lines: InterestLin
   }
   if (lines.some(({ quantity }) => !Number.isInteger(quantity) || quantity < 1 || quantity > 99)) {
     return 'quantity'
+  }
+  const vendorId = lines[0]?.product.vendor_id
+  if (!vendorId || lines.some(({ product }) => product.vendor_id !== vendorId)) {
+    return 'vendor'
   }
   return null
 }

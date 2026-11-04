@@ -27,7 +27,7 @@ export type PublicCatalogueProduct = Pick<Product,
   'id' | 'name_en' | 'name_kn' | 'description_en' | 'description_kn' |
   'category' | 'image_url' | 'mrp' | 'selling_price' | 'is_active' |
   'sort_order' | 'created_at' | 'updated_at'
-> & { stock_status: StockStatus }
+> & { vendor_id: string; stock_status: StockStatus }
 
 export type VendorApplication = {
   id: string
@@ -121,14 +121,6 @@ export type Database = {
       }
     }
     Functions: {
-      submit_interest: {
-        Args: {
-          p_customer_name: string
-          p_customer_phone: string
-          p_items: { product_id: string; quantity: number }[]
-        }
-        Returns: { enquiry_id: string; reference_code: string }
-      }
       submit_vendor_application: {
         Args: { p_business_name: string; p_owner_name: string; p_phone: string; p_location: string }
         Returns: VendorApplication

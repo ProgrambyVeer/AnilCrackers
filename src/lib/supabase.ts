@@ -1,11 +1,17 @@
 import { createClient } from '@supabase/supabase-js'
 import type { Database } from '../types'
+import { describeSupabaseConfigIssue, validateSupabaseConfig, type SupabaseConfigIssue } from './supabase-config'
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
+const config = validateSupabaseConfig(
+  import.meta.env.VITE_SUPABASE_URL,
+  import.meta.env.VITE_SUPABASE_ANON_KEY,
+  (import.meta.env.VITE_ENV_SAFETY_STRIPPED ?? '').split(',').filter(Boolean),
+)
 
-export const supabase = supabaseUrl && supabaseAnonKey
-  ? createClient<Database>(supabaseUrl, supabaseAnonKey, {
+export const supabaseConfigIssue: SupabaseConfigIssue | null = config.ok ? null : config.issue
+
+export const supabase = config.ok
+  ? createClient<Database>(config.url, config.key, {
       auth: {
         autoRefreshToken: true,
         persistSession: true,
@@ -16,7 +22,7 @@ export const supabase = supabaseUrl && supabaseAnonKey
 
 export function requireSupabase() {
   if (!supabase) {
-    throw new Error('Supabase is not configured. Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to your environment.')
+    throw new Error(`Supabase is not configured. ${describeSupabaseConfigIssue(supabaseConfigIssue ?? 'missing-url')}`)
   }
   return supabase
 }

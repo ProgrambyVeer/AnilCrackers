@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { makeWhatsAppMessage, makeWhatsAppUrl, validateInterest, type InterestLine } from './interest'
+import { normalizeIndianMobile } from './indian-mobile'
 import { translate } from './i18n'
 import { clearInterestQuantities, CUSTOMER_INTEREST_STORAGE_KEY, parseInterestQuantities, serializeInterestQuantities, updateInterestQuantity } from './customer-interest'
 import { getStockStatus, isValidStockValue } from './stock'
@@ -29,6 +30,7 @@ const lines: InterestLine[] = [{ product, quantity: 2 }]
 describe('interest enquiry helpers', () => {
   it('accepts a valid customer and a +91 mobile number', () => {
     expect(validateInterest('Asha Rao', '+91 98765 43210', lines)).toBeNull()
+    expect(validateInterest('Asha Rao', '(98765) 43210', lines)).toBeNull()
   })
 
   it('rejects invalid names, phone numbers, and empty lists', () => {
@@ -39,6 +41,14 @@ describe('interest enquiry helpers', () => {
 
   it('rejects invalid quantities', () => {
     expect(validateInterest('Asha Rao', '9876543210', [{ product, quantity: 100 }])).toBe('quantity')
+  })
+
+  it('rejects interest lists containing products from multiple vendors', () => {
+    const anotherVendorLine: InterestLine = {
+      product: { ...product, id: 'different-product', vendor_id: '00000000-0000-4000-8000-000000000009' },
+      quantity: 1,
+    }
+    expect(validateInterest('Asha Rao', '9876543210', [...lines, anotherVendorLine])).toBe('vendor')
   })
 
   it('encodes an interest-only WhatsApp message in the selected language', () => {
@@ -53,6 +63,20 @@ describe('interest enquiry helpers', () => {
     expect(message).not.toContain('order')
   })
 
+  describe('Indian vendor mobile normalization', () => {
+    it('normalizes valid Indian mobiles with or without the country code', () => {
+      expect(normalizeIndianMobile('9876543210')).toBe('+919876543210')
+      expect(normalizeIndianMobile('+91 98765-43210')).toBe('+919876543210')
+      expect(normalizeIndianMobile('(98765) 43210')).toBe('+919876543210')
+    })
+
+    it('rejects invalid, non-Indian, or malformed numbers', () => {
+      expect(normalizeIndianMobile('1234567890')).toBeNull()
+      expect(normalizeIndianMobile('+1 202 555 0100')).toBeNull()
+      expect(normalizeIndianMobile('abc 9876543210')).toBeNull()
+    })
+  })
+
   it('uses Kannada product names and text for Kannada customers', () => {
     const url = makeWhatsAppUrl('919876543210', 'ಅಶಾ', '9876543210', lines, 'kn')
     const message = new URL(url).searchParams.get('text') ?? ''
@@ -64,6 +88,8 @@ describe('interest enquiry helpers', () => {
     expect(translate('en', 'enquiryNotice')).toContain('No online sale')
     expect(translate('kn', 'enquiryNotice')).toContain('ಆನ್‌ಲೈನ್ ಮಾರಾಟ')
     expect(translate('kn', 'submitInterest')).toBe('ವಾಟ್ಸಾಪ್ ಮೂಲಕ ಆಸಕ್ತಿ ಕಳುಹಿಸಿ')
+    expect(translate('en', 'privacyNote')).toContain('authorized platform administrators')
+    expect(translate('kn', 'privacyNote')).toContain('ಅಧಿಕೃತ ಪ್ಲಾಟ್‌ಫಾರ್ಮ್ ನಿರ್ವಾಹಕರೊಂದಿಗೆ')
   })
 })
 
