@@ -10,6 +10,9 @@ const config = validateSupabaseConfig(
 
 export const supabaseConfigIssue: SupabaseConfigIssue | null = config.ok ? null : config.issue
 
+// Public (anon/publishable) values only; validation above rejects secret-shaped keys.
+export const supabasePublicConfig = config.ok ? { url: config.url, key: config.key } : null
+
 export const supabase = config.ok
   ? createClient<Database>(config.url, config.key, {
       auth: {

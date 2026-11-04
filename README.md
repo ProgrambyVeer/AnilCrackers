@@ -73,6 +73,9 @@ When the settings are invalid:
 - Supabase Site URL: the application origin (Vercel domain in production).
 - Supabase allowed redirect URLs: local Vite origin and production origin.
 - On the Google consent screen, configure publishing/test-user settings appropriate for the two staff Google accounts.
+- `VITE_PUBLIC_SITE_URL` (optional, production only): the canonical https origin, for example `https://YOUR_PRODUCTION_DOMAIN`. When set, Google sign-in always returns to `<that origin>/vendor` or `<that origin>/admin`, even if sign-in was started from a per-deployment Vercel preview URL. When unset or invalid, the current browser origin is used. Development always returns to the local Vite origin. Placeholder values containing `YOUR_` are ignored.
+- The redirect path is fixed per portal (`/vendor` or `/admin`) and is never taken from the current URL. Supabase still rejects any `redirect_to` that is not in its allowed redirect URL list and falls back to the Site URL.
+- If the Google provider is disabled in Supabase, Supabase answers `Unsupported provider: provider is not enabled`. The sign-in button checks the public `/auth/v1/settings` endpoint first and shows an explanatory message instead. This only improves the error; enabling Google must be done in the Supabase Dashboard.
 
 ## Security model
 
@@ -165,7 +168,7 @@ Source review: migration 002 gates product reads/writes on active approved owner
 
 1. Push this repository to a private GitHub repository.
 2. Import that repository into one Vercel project.
-3. Set `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` in Vercel project environment variables for Preview and Production.
+3. Set `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` in Vercel project environment variables for Preview and Production. Set `VITE_PUBLIC_SITE_URL` to the canonical production origin for Production (and optionally Preview, so preview sign-ins return to production).
 4. Deploy. [`vercel.json`](./vercel.json) rewrites direct route visits and refreshes (`/vendor`, `/admin`) to the React app.
 5. Add the deployment domain under Supabase Auth's allowed redirect URLs and configure it as the Supabase Site URL.
 6. Add `anilcrackers.teranode1.com` to Vercel's domain settings and configure the DNS records Vercel specifies with the domain/DNS provider. No DNS or production changes have been made by this project.

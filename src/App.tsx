@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react'
-import { BrowserRouter, Link, Navigate, Route, Routes, useLocation } from 'react-router-dom'
+import { BrowserRouter, Link, Navigate, Route, Routes } from 'react-router-dom'
 import {
   ArrowRight,
   ArrowUpRight,
@@ -32,7 +32,8 @@ import { makeWhatsAppMessage, makeWhatsAppUrl, validateInterest } from './lib/in
 import { normalizeIndianMobile } from './lib/indian-mobile'
 import { captchaProvider, captchaSitekey, protectedSubmissionEnabled, submitProtectedInterest } from './lib/submit-interest'
 import { CaptchaChallenge } from './CaptchaChallenge'
-import { requireSupabase, supabase, supabaseConfigIssue } from './lib/supabase'
+import { requireSupabase, supabase, supabaseConfigIssue, supabasePublicConfig } from './lib/supabase'
+import { googleProviderDisabledMessage, isGoogleProviderEnabled, resolveOAuthRedirect } from './lib/auth-redirect'
 import { describeSupabaseConfigIssue } from './lib/supabase-config'
 import { applyImageFallback, classifyCatalogueError, describeCatalogueIssue, productImageSrc, staffErrorMessage, type CatalogueIssue } from './lib/catalogue'
 import { getStockStatus, isValidStockValue, type StockStatus } from './lib/stock'
@@ -567,7 +568,6 @@ function formatPrice(value: number) {
 }
 
 function StaffGate({ role, children }: { role: UserRole; children: React.ReactNode }) {
-  const location = useLocation()
   const [profile, setProfile] = useState<Profile | null>(null)
   const [application, setApplication] = useState<VendorApplication | null>(null)
   const [hasSession, setHasSession] = useState(false)
@@ -576,6 +576,7 @@ function StaffGate({ role, children }: { role: UserRole; children: React.ReactNo
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [signingIn, setSigningIn] = useState(false)
+  const [signInError, setSignInError] = useState('')
 
   useEffect(() => {
     if (DEV_STAFF_PREVIEW || !supabase) return
@@ -634,17 +635,28 @@ function StaffGate({ role, children }: { role: UserRole; children: React.ReactNo
   }
 
   async function signIn() {
-    setError('')
+    setSignInError('')
     setSigningIn(true)
     try {
       const client = requireSupabase()
+      if (supabasePublicConfig) {
+        const googleEnabled = await isGoogleProviderEnabled(supabasePublicConfig.url, supabasePublicConfig.key)
+        if (googleEnabled === false) throw new Error(googleProviderDisabledMessage)
+      }
       const { error: authError } = await client.auth.signInWithOAuth({
         provider: 'google',
-        options: { redirectTo: `${window.location.origin}${location.pathname}` },
+        options: {
+          redirectTo: resolveOAuthRedirect({
+            role,
+            currentOrigin: window.location.origin,
+            isDev: import.meta.env.DEV,
+            configuredSiteUrl: import.meta.env.VITE_PUBLIC_SITE_URL,
+          }),
+        },
       })
       if (authError) throw authError
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'Unable to start Google sign-in.')
+      setSignInError(cause instanceof Error ? cause.message : 'Unable to start Google sign-in.')
       setSigningIn(false)
     }
   }
@@ -664,7 +676,7 @@ function StaffGate({ role, children }: { role: UserRole; children: React.ReactNo
     return <AccessMessage title="Account not provisioned" message="This Google account has no assigned staff role yet. Vendor applications are available from the vendor portal." back />
   }
   if (!profile) {
-    return <SignInPage role={role} error={error} signingIn={signingIn} onSignIn={() => void signIn()} />
+    return <SignInPage role={role} error={error || signInError} signingIn={signingIn} onSignIn={() => void signIn()} />
   }
   if (!profile.is_active || profile.role !== role) {
     return <AccessMessage title={translate('en', 'accessDenied')} message={!profile.is_active ? 'This account has been disabled. Contact the platform administrator.' : 'Use the staff area assigned to your account.'} back />
